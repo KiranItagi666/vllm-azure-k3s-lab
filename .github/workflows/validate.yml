@@ -1,0 +1,34 @@
+name: Validate vLLM lab
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+        with:
+          version: v4.3.2
+
+      - name: Lint and render the Helm chart
+        shell: bash
+        run: |
+          helm lint charts/vllm-t4 --namespace vllm-example
+          helm template vllm-t4 charts/vllm-t4 --namespace vllm-example > /dev/null
+
+      - name: Verify diagnostic permissions
+        shell: pwsh
+        run: ./scripts/Test-Diagnostics.ps1 -RepoRoot $env:GITHUB_WORKSPACE

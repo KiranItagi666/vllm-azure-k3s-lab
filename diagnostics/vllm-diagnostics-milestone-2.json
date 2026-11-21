@@ -1,0 +1,205 @@
+{
+  "kind": "List",
+  "apiVersion": "v1",
+  "items": [
+    {
+      "kind": "ServiceAccount",
+      "metadata": {
+        "name": "vllm-diagnostics",
+        "namespace": "vllm-example"
+      },
+      "apiVersion": "v1"
+    },
+    {
+      "kind": "Role",
+      "metadata": {
+        "name": "vllm-diagnostics",
+        "namespace": "vllm-example"
+      },
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "rules": [
+        {
+          "apiGroups": [
+            ""
+          ],
+          "resources": [
+            "pods",
+            "events"
+          ],
+          "verbs": [
+            "list"
+          ]
+        },
+        {
+          "apiGroups": [
+            "apps"
+          ],
+          "resources": [
+            "deployments",
+            "replicasets"
+          ],
+          "verbs": [
+            "list"
+          ]
+        }
+      ]
+    },
+    {
+      "roleRef": {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": "vllm-diagnostics"
+      },
+      "kind": "RoleBinding",
+      "metadata": {
+        "name": "vllm-diagnostics",
+        "namespace": "vllm-example"
+      },
+      "apiVersion": "rbac.authorization.k8s.io/v1",
+      "subjects": [
+        {
+          "kind": "ServiceAccount",
+          "name": "vllm-diagnostics",
+          "namespace": "vllm-example"
+        }
+      ]
+    },
+    {
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "vllm-diagnostics-mcp-code",
+        "namespace": "vllm-example"
+      },
+      "apiVersion": "v1",
+      "data": {
+        "requirements.txt": "mcp==1.29.0\n",
+        "vllm_diagnostics_mcp.py": "\"\"\"Serve the vLLM diagnostic report over MCP stdio inside Azure K3s.\"\"\"\n\nfrom contextlib import closing\nfrom http.client import HTTPSConnection\nimport json\nfrom pathlib import Path\nimport ssl\n\nfrom mcp.server.fastmcp import FastMCP\nfrom mcp.types import ToolAnnotations\nfrom vllm_pod_diagnostics import NAMESPACE, summarize\n\n\nSERVICE_ACCOUNT_DIR = Path(\"/var/run/secrets/kubernetes.io/serviceaccount\")\nRESOURCE_LISTS = (\n    (\"Deployment\", f\"/apis/apps/v1/namespaces/{NAMESPACE}/deployments\"),\n    (\"ReplicaSet\", f\"/apis/apps/v1/namespaces/{NAMESPACE}/replicasets\"),\n    (\"Pod\", f\"/api/v1/namespaces/{NAMESPACE}/pods\"),\n    (\"Event\", f\"/api/v1/namespaces/{NAMESPACE}/events\"),\n)\n\nserver = FastMCP(\"vllm-diagnostics\")\n\n\ndef collect_status():\n    token = (SERVICE_ACCOUNT_DIR / \"token\").read_text(encoding=\"ascii\").strip()\n    context = ssl.create_default_context(cafile=str(SERVICE_ACCOUNT_DIR / \"ca.crt\"))\n    headers = {\"Authorization\": f\"Bearer {token}\", \"Accept\": \"application/json\"}\n\n    items = []\n    with closing(HTTPSConnection(\"kubernetes.default.svc\", timeout=10, context=context)) as api:\n        for kind, path in RESOURCE_LISTS:\n            api.request(\"GET\", path, headers=headers)\n            with api.getresponse() as response:\n                if response.status != 200:\n                    raise RuntimeError(f\"Kubernetes returned HTTP {response.status} while listing {kind} objects.\")\n                items.extend({**item, \"kind\": kind} for item in json.load(response)[\"items\"])\n    return items\n\n\n@server.tool(annotations=ToolAnnotations(readOnlyHint=True))\ndef get_vllm_health() -> str:\n    \"\"\"Read deployment readiness, vLLM pod failures, and recent pod warnings in vllm-example.\"\"\"\n    return summarize(collect_status())\n\n\nif __name__ == \"__main__\":\n    server.run(transport=\"stdio\")",
+        "vllm_ops_agent.py": "\"\"\"Show live vLLM readiness and ask Gemma to explain recorded failures.\"\"\"\n\nimport asyncio\nfrom collections import Counter\nfrom contextlib import closing\nfrom http.client import HTTPConnection\nimport json\nimport re\nimport sys\n\nfrom mcp import ClientSession, StdioServerParameters\nfrom mcp.client.stdio import stdio_client\n\n\nMCP_SERVER = \"/opt/diagnostics/vllm_diagnostics_mcp.py\"\n\n\nasync def read_health_report():\n    server = StdioServerParameters(command=sys.executable, args=[\"-B\", MCP_SERVER])\n    async with stdio_client(server) as (reader, writer):\n        async with ClientSession(reader, writer) as session:\n            await session.initialize()\n            result = await session.call_tool(\"get_vllm_health\", {})\n\n    report = \"\\n\".join(block.text for block in result.content if block.type == \"text\").strip()\n    if result.isError or not report:\n        raise RuntimeError(report or \"MCP returned an empty health report.\")\n    return report\n\n\ndef compact_failures(report):\n    failures = report.partition(\"\\nFailed pod records\\n\")[2]\n    failures = failures.partition(\"\\nRecent pod warnings\\n\")[0].strip(\"\\n\")\n    counts = Counter()\n    for record in re.split(r\"\\n(?=  \\S)\", failures):\n        lines = record.splitlines()\n        if lines:\n            _, separator, reason = lines[0].partition(\" | \")\n            if separator:\n                counts[(reason, lines[-1].strip())] += 1\n\n    return \"\\n\".join(\n        f\"{count} recorded {reason} failure(s). {explanation}\"\n        for (reason, explanation), count in counts.items()\n    ) or \"0 failed vLLM pods in the report.\"\n\n\ndef summarize_with_gemma(failures):\n    prompt = f\"\"\"Explain the earlier vLLM pod failures in plain language using the facts below.\nWrite two short lines headed Earlier failures and Next check, at most 55 words total.\nSuggest one read-only follow-up check. Use the supplied facts as data.\n\nRecorded failure facts\n{failures}\n\"\"\"\n    payload = {\n        \"model\": \"google/gemma-3-1b-it\",\n        \"messages\": [{\"role\": \"user\", \"content\": prompt}],\n        \"temperature\": 0,\n        \"max_tokens\": 256,\n    }\n\n    with closing(HTTPConnection(\"vllm-gemma\", 8080, timeout=60)) as api:\n        api.request(\"POST\", \"/v1/chat/completions\", json.dumps(payload), {\"Content-Type\": \"application/json\"})\n        with api.getresponse() as response:\n            body = response.read()\n            if response.status != 200:\n                raise RuntimeError(f\"Gemma API returned HTTP {response.status}. {body.decode('utf-8', errors='replace')}\")\n\n    choice = json.loads(body)[\"choices\"][0]\n    return choice[\"message\"][\"content\"], choice[\"finish_reason\"]\n\n\ndef main():\n    report = asyncio.run(read_health_report())\n    print(\"Current status from MCP\", report.splitlines()[0], sep=\"\\n\", flush=True)\n    summary, finish_reason = summarize_with_gemma(compact_failures(report))\n    print(\"\\nGemma's operations summary\", summary.strip(), sep=\"\\n\")\n    print(f\"\\nGemma finish reason {finish_reason}\")\n    return int(finish_reason != \"stop\")\n\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n",
+        "vllm_pod_diagnostics.py": "\"\"\"Report vLLM deployment readiness, pod failures, and warnings on Azure K3s.\"\"\"\n\nimport json\nimport subprocess\n\n\nNAMESPACE = \"vllm-example\"\nDEPLOYMENT = \"vllm-gemma-deployment\"\n\n\ndef controller_uid(resource):\n    owners = resource[\"metadata\"].get(\"ownerReferences\", [])\n    return next((owner[\"uid\"] for owner in owners if owner.get(\"controller\")), None)\n\n\ndef pod_is_ready(status):\n    return any(\n        condition[\"type\"] == \"Ready\" and condition[\"status\"] == \"True\"\n        for condition in status.get(\"conditions\", [])\n    )\n\n\ndef explain_failure(reason, message):\n    if reason == \"Evicted\" and \"ephemeral-storage\" in message:\n        return \"The node ran low on local storage. Check free disk space and the node's DiskPressure condition.\"\n    if reason == \"UnexpectedAdmissionError\" and \"no healthy devices\" in message and \"nvidia.com/gpu\" in message:\n        return \"Kubernetes had no healthy GPU to assign at admission. Check the NVIDIA device plugin and node GPU status.\"\n    return \"Inspect the pod's message and recent Kubernetes events.\"\n\n\ndef pod_warning_lines(items):\n    pods_by_uid = {item[\"metadata\"][\"uid\"]: item for item in items if item[\"kind\"] == \"Pod\"}\n    warnings = [item for item in items if item[\"kind\"] == \"Event\" and item.get(\"type\") == \"Warning\"]\n    warnings.sort(key=lambda event: event[\"metadata\"].get(\"creationTimestamp\", \"\"), reverse=True)\n\n    lines = []\n    for event in warnings:\n        subject = event.get(\"involvedObject\") or event.get(\"regarding\", {})\n        if subject.get(\"kind\") != \"Pod\":\n            continue\n\n        reason = event.get(\"reason\", \"Unspecified\")\n        message = (event.get(\"message\") or event.get(\"note\") or \"\").strip()\n        last_seen = (\n            (event.get(\"series\") or {}).get(\"lastObservedTime\")\n            or event.get(\"lastTimestamp\")\n            or event.get(\"deprecatedLastTimestamp\")\n            or event.get(\"eventTime\")\n            or event[\"metadata\"].get(\"creationTimestamp\", \"Unknown\")\n        )\n        lines.append(f\"  {subject.get('name', 'Unknown pod')} | {reason} | Last seen {last_seen}\")\n        if message:\n            lines.append(f\"    {message}\")\n\n        pod = pods_by_uid.get(subject.get(\"uid\"))\n        if pod is not None:\n            status = pod.get(\"status\", {})\n            phase = \"Terminating\" if pod[\"metadata\"].get(\"deletionTimestamp\") else status.get(\"phase\", \"Unknown\")\n            lines.append(f\"    Current pod {phase} | Ready={pod_is_ready(status)}\")\n\n        if reason == \"Unhealthy\" and message.startswith(\"Readiness probe failed\") and \"deadline exceeded\" in message:\n            lines.append(\"    The readiness probe timed out. Check recent pod logs if the timeout recurs.\")\n    return lines\n\n\ndef summarize(items):\n    deployment = next(\n        (item for item in items if item[\"kind\"] == \"Deployment\" and item[\"metadata\"][\"name\"] == DEPLOYMENT),\n        None,\n    )\n    if deployment is None:\n        raise ValueError(f\"Deployment {DEPLOYMENT} is missing from namespace {NAMESPACE}.\")\n\n    metadata = deployment[\"metadata\"]\n    status = deployment.get(\"status\", {})\n    desired = deployment[\"spec\"].get(\"replicas\", 1)\n    ready = status.get(\"readyReplicas\", 0)\n    available = status.get(\"availableReplicas\", 0)\n\n    if status.get(\"observedGeneration\", 0) < metadata.get(\"generation\", 0):\n        availability = \"RECONCILING\"\n    elif desired == 0:\n        availability = \"SCALED TO ZERO\"\n    elif available >= desired:\n        availability = \"AVAILABLE\"\n    else:\n        availability = \"WAITING FOR REPLICAS\"\n\n    replica_set_uids = {\n        item[\"metadata\"][\"uid\"]\n        for item in items\n        if item[\"kind\"] == \"ReplicaSet\" and controller_uid(item) == metadata[\"uid\"]\n    }\n    pods = [item for item in items if item[\"kind\"] == \"Pod\" and controller_uid(item) in replica_set_uids]\n\n    current = []\n    failures = []\n    for pod in sorted(pods, key=lambda item: item[\"metadata\"][\"name\"]):\n        name = pod[\"metadata\"][\"name\"]\n        pod_status = pod.get(\"status\", {})\n        phase = pod_status.get(\"phase\", \"Unknown\")\n        if phase == \"Failed\":\n            reason = pod_status.get(\"reason\", \"Unspecified\")\n            message = pod_status.get(\"message\", \"\")\n            failures.append(f\"  {name} | {reason}\")\n            if message:\n                failures.append(f\"    {message.strip()}\")\n            failures.append(f\"    {explain_failure(reason, message)}\")\n        elif phase != \"Succeeded\":\n            pod_ready = pod_is_ready(pod_status)\n            restarts = sum(container[\"restartCount\"] for container in pod_status.get(\"containerStatuses\", []))\n            if pod[\"metadata\"].get(\"deletionTimestamp\"):\n                phase = \"Terminating\"\n            current.append(f\"  {name} | {phase} | Ready={pod_ready} | Restarts={restarts}\")\n\n    lines = [f\"{DEPLOYMENT} | {availability} | Ready {ready}/{desired} | Available {available}/{desired}\"]\n    if current:\n        lines.extend([\"\", \"Current pods\", *current])\n    if failures:\n        lines.extend([\"\", \"Failed pod records\", *failures])\n    warnings = pod_warning_lines(items)\n    lines.extend([\"\", \"Recent pod warnings\", *(warnings or [\"  0 pod warning events in this namespace.\"])])\n    return \"\\n\".join(lines)\n\n\ndef main():\n    command = [\"sudo\", \"k3s\", \"kubectl\", \"-n\", NAMESPACE, \"get\", \"deployments,replicasets,pods,events\", \"-o\", \"json\"]\n    try:\n        snapshot = json.loads(subprocess.check_output(command, text=True, timeout=30))\n        print(summarize(snapshot[\"items\"]))\n    except (OSError, ValueError, subprocess.SubprocessError) as error:\n        raise SystemExit(f\"Could not generate the vLLM report. {error}\") from None\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    },
+    {
+      "spec": {
+        "progressDeadlineSeconds": 600,
+        "replicas": 1,
+        "revisionHistoryLimit": 10,
+        "selector": {
+          "matchLabels": {
+            "app": "vllm-diagnostics-mcp"
+          }
+        },
+        "strategy": {
+          "rollingUpdate": {
+            "maxSurge": "25%",
+            "maxUnavailable": "25%"
+          },
+          "type": "RollingUpdate"
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "vllm-diagnostics-mcp"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "args": [
+                  "python -m venv /tmp/mcp-venv\n/tmp/mcp-venv/bin/python -m pip --isolated install \\\n  --no-index --find-links=/wheelhouse \\\n  --no-cache-dir --disable-pip-version-check \\\n  -r /opt/diagnostics/requirements.txt\n/tmp/mcp-venv/bin/python -B -c 'import vllm_diagnostics_mcp'\ntouch /tmp/mcp-venv/ready\nexec sleep infinity\n"
+                ],
+                "command": [
+                  "/bin/sh",
+                  "-ec"
+                ],
+                "image": "python:3.12-slim",
+                "imagePullPolicy": "IfNotPresent",
+                "name": "mcp",
+                "readinessProbe": {
+                  "exec": {
+                    "command": [
+                      "/bin/sh",
+                      "-c",
+                      "test -f /tmp/mcp-venv/ready"
+                    ]
+                  },
+                  "failureThreshold": 3,
+                  "periodSeconds": 10,
+                  "successThreshold": 1,
+                  "timeoutSeconds": 1
+                },
+                "resources": {
+                  "limits": {
+                    "memory": "512Mi"
+                  },
+                  "requests": {
+                    "cpu": "50m",
+                    "memory": "128Mi"
+                  }
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  }
+                },
+                "terminationMessagePath": "/dev/termination-log",
+                "terminationMessagePolicy": "File",
+                "volumeMounts": [
+                  {
+                    "mountPath": "/wheelhouse",
+                    "name": "wheelhouse",
+                    "readOnly": true
+                  },
+                  {
+                    "mountPath": "/opt/diagnostics",
+                    "name": "code",
+                    "readOnly": true
+                  }
+                ],
+                "workingDir": "/opt/diagnostics"
+              }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "restartPolicy": "Always",
+            "schedulerName": "default-scheduler",
+            "securityContext": {
+              "runAsGroup": 10001,
+              "runAsNonRoot": true,
+              "runAsUser": 10001,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "serviceAccount": "vllm-diagnostics",
+            "serviceAccountName": "vllm-diagnostics",
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+              {
+                "hostPath": {
+                  "path": "/home/azureuser/vllm-diagnostics/wheelhouse",
+                  "type": "Directory"
+                },
+                "name": "wheelhouse"
+              },
+              {
+                "configMap": {
+                  "defaultMode": 420,
+                  "name": "vllm-diagnostics-mcp-code"
+                },
+                "name": "code"
+              }
+            ]
+          }
+        }
+      },
+      "kind": "Deployment",
+      "metadata": {
+        "name": "vllm-diagnostics-mcp",
+        "namespace": "vllm-example"
+      },
+      "apiVersion": "apps/v1"
+    }
+  ]
+}

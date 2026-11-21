@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gemma-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma-server
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: gemma-server
+    spec:
+      containers:
+      - args:
+        - --model=$(MODEL_ID)
+        - --tensor-parallel-size=1
+        - --host=0.0.0.0
+        - --port=8080
+        - --gpu-memory-utilization=0.85
+        - --max-num-seqs=64
+        - --dtype=float32
+        - --max-model-len=2048
+        - --enforce-eager
+        command:
+        - python3
+        - -m
+        - vllm.entrypoints.openai.api_server
+        env:
+        - name: MODEL_ID
+          value: google/gemma-3-1b-it
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64:/usr/local/cuda/lib64
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: hf_token
+              name: hf-secret
+        - name: VLLM_USE_FLASHINFER_SAMPLER
+          value: "0"
+        - name: VLLM_ATTENTION_BACKEND
+          value: TRITON_ATTN
+        image: vllm/vllm-openai:v0.11.0
+        name: inference-server
+        resources:
+          limits:
+            cpu: "2"
+            ephemeral-storage: 10Gi
+            memory: 10Gi
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "2"
+            ephemeral-storage: 10Gi
+            memory: 10Gi
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - mountPath: /usr/local/lib/python3.12/dist-packages/vllm/attention/ops/triton_unified_attention.py
+          name: t4-triton-patch
+          readOnly: true
+          subPath: triton_unified_attention.py
+        - mountPath: /dev/shm
+          name: dshm
+      runtimeClassName: nvidia
+      volumes:
+      - configMap:
+          name: vllm-t4-triton-patch
+        name: t4-triton-patch
+      - emptyDir:
+          medium: Memory
+        name: dshm
+status: {}

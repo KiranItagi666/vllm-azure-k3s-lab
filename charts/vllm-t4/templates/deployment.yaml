@@ -1,0 +1,5 @@
+{{- $deployment := .Files.Get "files/deployment.yaml" | fromYaml -}}
+{{- $_ := unset $deployment "status" -}}
+{{- $_ := unset $deployment.metadata "namespace" -}}
+{{- $_ := unset $deployment.metadata "creationTimestamp" -}}
+{{ toYaml $deployment }}

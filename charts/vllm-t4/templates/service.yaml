@@ -1,0 +1,12 @@
+{{- $deployment := .Files.Get "files/deployment.yaml" | fromYaml -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-gemma
+spec:
+  type: ClusterIP
+  selector:
+    {{- toYaml $deployment.spec.selector.matchLabels | nindent 4 }}
+  ports:
+    - port: 8080
+      targetPort: 8080

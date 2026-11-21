@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-t4-triton-patch
+data:
+  triton_unified_attention.py: |
+{{ .Files.Get "files/triton_unified_attention.py" | indent 4 }}
